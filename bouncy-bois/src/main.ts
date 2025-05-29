@@ -2,13 +2,18 @@ import * as three from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import GUI from "lil-gui";
 import {
-  buildRandomVertexPosition,
-  createGeometry,
   floorWidth,
-  world,
+  type randomGeometry,
+  type ObjectBody,
+  type PointPosition,
 } from "./utils";
 import RAPIER from "@dimforge/rapier3d-compat";
+import { createMesh } from "./three-helper";
 await RAPIER.init();
+
+const worker = new Worker(new URL("worker.ts", import.meta.url), {
+  type: "module",
+});
 
 /**
  * Base
@@ -43,9 +48,61 @@ scene.add(directionalLight);
 /**
  * Meshes
  */
-const worldObjects = Array.from({ length: 20 }).map(() =>
-  createGeometry("sphere", buildRandomVertexPosition())
-);
+type WorldObjects = ObjectBody & {
+  mesh: three.Mesh;
+};
+let worldObjects: Map<string, WorldObjects> = new Map();
+
+worker.onmessage = ({ data: { type, payload } }) => {
+  if (type === "Rapier Ready") {
+    Array.from({ length: 20 }).forEach(() => {
+      const threeMesh = createMesh("sphere");
+      worldObjects.set(threeMesh.id, threeMesh);
+      scene.add(threeMesh.mesh);
+    });
+
+    worker.postMessage({
+      type: "Add Objects",
+      payload: {
+        data: Array.from(worldObjects.values()).map(
+          ({ id, geometry, position, randomScale }) => ({
+            id,
+            geometry,
+            position,
+            randomScale,
+          })
+        ),
+      },
+    });
+  }
+
+  if (type === "Update Meshes") {
+    const { data } = payload;
+    data.forEach(
+      ({
+        id,
+        position,
+        rotation,
+      }: {
+        id: string;
+        position: PointPosition;
+        rotation: PointPosition & {
+          w: number;
+        };
+      }) => {
+        worldObjects.get(id)?.mesh.position.copy(position);
+        worldObjects.get(id)?.mesh.quaternion.copy(rotation);
+      }
+    );
+  }
+
+  if (type === "Rotate Floor") {
+    const { newFloorRotationX, translation, rotation } = payload;
+    guiObj.floorRotationX = newFloorRotationX;
+    floor.position.copy(translation);
+    floor.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+  }
+};
 
 const floorGeometry = new three.BoxGeometry(
   floorWidth * 2,
@@ -62,28 +119,8 @@ const floorMaterial = new three.MeshStandardMaterial({
 
 // forgot standard material needs lighting
 const floor = new three.Mesh(floorGeometry, floorMaterial);
-floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
-
-const generateObjects = (): void => {
-  worldObjects.forEach(({ mesh }) => scene.add(mesh));
-};
-generateObjects();
-
-/**
- * Rapier Physics
- */
-
-const rapierFloor =
-  RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 0, 0);
-const rapierFloorBody = world.createRigidBody(rapierFloor);
-const floorColliderDesc = RAPIER.ColliderDesc.cuboid(
-  floorWidth,
-  0.001,
-  floorWidth
-).setRestitution(0.5);
-world.createCollider(floorColliderDesc, rapierFloorBody);
 
 /**
  * GUI Functions
@@ -95,11 +132,25 @@ const guiObj = {
   isRaining: false,
   rainSpeedTimer: 5,
   rainingInterval: null as number | null, // setInterval returns a number type
-  createObject: () => {
+  createObject: (geometry = "sphere") => {
     // just do all spheres for now
     // const geometryType = Math.random() < 0.5 ? "box" : "sphere";
-    worldObjects.push(createGeometry("sphere", buildRandomVertexPosition()));
-    generateObjects();
+    const newMesh = createMesh(geometry as randomGeometry);
+    worldObjects.set(newMesh.id, newMesh);
+    scene.add(newMesh.mesh);
+    worker.postMessage({
+      type: "Add Objects",
+      payload: {
+        data: [
+          {
+            id: newMesh.id,
+            geometry: newMesh.geometry,
+            position: newMesh.position,
+            randomScale: newMesh.randomScale,
+          },
+        ],
+      },
+    });
   },
 
   tipFloor: () => {
@@ -109,22 +160,13 @@ const guiObj = {
   resetFloor: () => {
     guiObj.isFloorAnimating = false;
     guiObj.floorRotationX = 0;
-
-    // trippy rapier rotation, setting all 0s doesnt put it back to 0
-    // needs that last 1 in the w param for some reason, but it works
-    rapierFloorBody.setRotation(new RAPIER.Quaternion(0, 0, 0, 1), true);
   },
 
   makeItRain: () => {
     if (!guiObj.isRaining) {
       guiObj.isRaining = true;
       guiObj.rainingInterval = setInterval(() => {
-        const sphere = createGeometry(
-          Math.random() < 0.5 ? "box" : "sphere",
-          buildRandomVertexPosition()
-        );
-        worldObjects.push(sphere);
-        scene.add(sphere.mesh);
+        guiObj.createObject(Math.random() <= 0.5 ? "sphere" : "box");
       }, guiObj.rainSpeedTimer);
     }
   },
@@ -194,7 +236,7 @@ const camera = new three.PerspectiveCamera(
   0.1,
   100
 );
-camera.position.set(0, 7, 25);
+camera.position.set(0, 10, 35);
 scene.add(camera);
 
 // Controls
@@ -228,41 +270,30 @@ const tick = (): void => {
   // Update controls
   controls.update();
 
-  world.step();
-  worldObjects.forEach(({ mesh, rapierBody }, index) => {
-    /**
-     * Todo, fix cone
-     */
-    // for cone shape, the translation would give the threejs mesh
-    // Craaaaaaaaaaazy wild variations on the position axis
-    // +/- 2000 in x/y/z axis
-    mesh.position.copy(rapierBody.translation());
-    mesh.quaternion.copy(rapierBody.rotation());
-
+  worker.postMessage({
+    type: "World Step",
+    payload: {
+      isFloorAnimating: guiObj.isFloorAnimating,
+      floorRotationX: guiObj.floorRotationX,
+      endFloorRotationAngle: guiObj.endFloorRotationAngle,
+      timeDelta,
+    },
+  });
+  // world.step();
+  worldObjects.forEach(({ id, mesh }, index) => {
     // get rid of object if it's below floor ( assuming cause it fell off the sides )
-    if (mesh.position.y <= -20) {
+    if (mesh.position.y <= -40) {
       scene.remove(mesh);
-      world.removeRigidBody(rapierBody);
-      worldObjects.splice(index, 1);
+      worldObjects.delete(id);
+      // worldObjects.splice(index, 1);
+      worker.postMessage({
+        type: "Remove Body",
+        payload: {
+          id,
+        },
+      });
     }
   });
-
-  if (guiObj.isFloorAnimating) {
-    if (guiObj.floorRotationX <= guiObj.endFloorRotationAngle) {
-      guiObj.floorRotationX += timeDelta * 0.1;
-      const quat = new RAPIER.Quaternion(
-        0,
-        0,
-        Math.sin(guiObj.floorRotationX),
-        Math.cos(guiObj.floorRotationX)
-      );
-
-      rapierFloorBody.setRotation(quat, true);
-    }
-  }
-  floor.position.copy(rapierFloorBody.translation());
-  const rQuat = rapierFloorBody.rotation();
-  floor.quaternion.set(rQuat.x, rQuat.y, rQuat.z, rQuat.w);
 
   // Render
   renderer.render(scene, camera);
